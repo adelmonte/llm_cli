@@ -100,7 +100,3 @@ drwxr-xr-x 20 user user  4096 Oct  3 10:25 ..
 You have several files including the llm.sh script itself, 
 some hidden git files, and a README.md.
 ```
-
-## License
-
-MIT
