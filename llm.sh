@@ -134,13 +134,10 @@ execute_command() {
         [Yy]|"")
             # Execute command
             local output
-            output=$(timeout 5s bash -c "$cmd" 2>&1)
+            output=$(bash -c "$cmd" 2>&1)
             local exit_code=$?
             
-            if [[ $exit_code -eq 124 ]]; then
-                echo "[ERROR: Command timed out after 5 seconds]"
-                return 1
-            elif [[ $exit_code -ne 0 ]]; then
+            if [[ $exit_code -ne 0 ]]; then
                 echo "[Command failed with exit code $exit_code]"
                 echo "$output"
                 return 1
