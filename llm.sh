@@ -54,6 +54,10 @@ spin() {
 # Typewriter effect for output
 typewriter() {
     local delay="${1:-0.005}"
+    
+    # Set trap for cancellation
+    trap 'echo; return 1' INT
+    
     while IFS= read -r line; do
         for (( i=0; i<${#line}; i++ )); do
             printf "%s" "${line:$i:1}"
@@ -61,6 +65,9 @@ typewriter() {
         done
         printf "\n"
     done
+    
+    # Remove trap
+    trap - INT
 }
 
 # Interactive model selection with fzf
@@ -364,12 +371,18 @@ show_greeter
 while true; do
     bind -x '"\C-l": clear_conversation' 2>/dev/null || true
     
-    # Read user input with properly escaped prompt for readline
+    # Read user input with history support
     input=""
     while [[ -z "$input" ]]; do
         read -e -p $'\001\033[1;36m\002> \001\033[0m\002' input
         read_status=$?
         
+        # Add to readline history
+        if [[ -n "$input" && $read_status -eq 0 ]]; then
+            history -s "$input"
+        fi
+        
+        # Handle Ctrl+D (EOF)
         if [[ $read_status -eq 1 ]]; then
             echo
             exit 0
@@ -405,5 +418,3 @@ while true; do
     # Make API call (handles tool execution automatically)
     make_api_call false
 done
-
-echo
