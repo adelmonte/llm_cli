@@ -1,13 +1,13 @@
 # llm-cli
 
-A lightweight bash script for interactive CLI conversations with LLM models via OpenAI-compatible APIs.
+A lightweight script for interactive CLI conversations with LLM models via OpenAI-compatible APIs.
 
 <img src="demo.png" width="600" alt="llm-cli demo">
 
 ## Features
 
 - **Command execution** - AI can run system commands with user confirmation
-- **Markdown rendering** (with bat or mdcat)
+- **Markdown rendering** (with bat or mdcat -- or python rich library)
 - **Model switching** on the fly (with fzf)
 - **Context-aware** - includes system info (date, distro, shell, editor)
 - **Interactive chat interface** with conversation history
@@ -22,7 +22,7 @@ A lightweight bash script for interactive CLI conversations with LLM models via 
    # For model selection menu
    sudo pacman -S install fzf
    
-   # For markdown rendering
+   # For bash markdown rendering
    sudo pacman -S bat or mdcat
    ```
 
