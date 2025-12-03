@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import sys
 import json
@@ -16,10 +15,9 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.theme import Theme
 
-# Configuration
-#API_BASE = "https://llm.ai/api"
-#API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXX"
-#MODEL = "x-ai/grok-4.1-fast:free"
+API_BASE = "https://openrouter.ai/api"
+API_KEY = "sk-or-v1-"
+MODEL = "z-ai/glm-4.6"
 
 # Nord theme for markdown only
 nord_theme = Theme({
@@ -59,21 +57,31 @@ DISTRO = get_distro()
 SHELL = os.path.basename(os.environ.get('SHELL', 'bash'))
 EDITOR = os.environ.get('EDITOR', 'vi')
 
-SYSTEM_PROMPT = f"""Current context: {datetime.now().strftime('%b %d %Y')} | Distro: {DISTRO} | Shell: {SHELL} | Editor: {EDITOR}
-
-IMPORTANT: Use the context information above to answer questions when possible. Only run commands when you need information NOT already provided in the context.
-
-To run system commands when needed, use this exact format: [RUN:your_command_here]
-
+SYSTEM_PROMPT = f"""You are a helpful AI assistant with shell command execution capabilities.
+Context: {datetime.now().strftime('%b %d %Y')} | {DISTRO} | {SHELL} | Editor: {EDITOR}
+## Command Execution
+When you need to run system commands, use: [RUN:command_here]
 Examples:
-- Check date: [RUN:date]
-- Current directory: [RUN:pwd]
-- List files: [RUN:ls -la]
-- Chain commands: [RUN:date && whoami]
-
-Run ONLY ONE command per user request. After receiving command output, provide a helpful response but DO NOT run additional verification commands.
-
-Always assume bash. Before running any command, consider if you can answer using the context provided above."""
+- [RUN:pwd] - check current directory
+- [RUN:ls -la] - list files
+- [RUN:cat file.txt] - read files
+- [RUN:grep -r "pattern" .] - search code
+Guidelines:
+- Use commands to gather information, check state, or perform actions
+- You can chain commands with && or use pipes
+- Prefer targeted commands over broad exploration
+- After getting command output, provide concise, helpful analysis
+## Response Style
+- Be concise and direct - avoid unnecessary preamble
+- Format code with proper syntax highlighting using markdown
+- For errors, suggest fixes or next steps
+- Use the context above to avoid unnecessary commands
+## Common Tasks
+- Code review/debugging: Ask to see relevant files first
+- System questions: Check with commands rather than guessing
+- File operations: Use appropriate tools (cat, grep, find, etc.)
+- Scripting: Provide working, tested solutions
+Always assume bash shell."""
 
 # Conversation history
 messages: List[Dict[str, str]] = []
@@ -84,15 +92,45 @@ if SYSTEM_PROMPT:
 
 # Track current model
 current_model = MODEL
+model_pricing = {"prompt": 0, "completion": 0}  # dollars per million tokens
 
 # Global flag for cancellation
 cancel_event = threading.Event()
 spinner_stop = threading.Event()
 
+def fetch_model_pricing():
+    """Fetch pricing for current model"""
+    global model_pricing
+    try:
+        response = requests.get(
+            f"{API_BASE}/v1/models",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            verify=False,
+            timeout=5
+        )
+        models = response.json()['data']
+        for m in models:
+            if m['id'] == current_model:
+                pricing = m.get('pricing', {})
+                model_pricing['prompt'] = float(pricing.get('prompt', 0))
+                model_pricing['completion'] = float(pricing.get('completion', 0))
+                break
+    except:
+        pass  # Silently fail if can't fetch pricing
+
 def show_greeter():
     """Display greeter with model info"""
-    console.clear()
-    console.print(f"[bold cyan]⚡ {current_model}[/bold cyan]")
+    # Use ANSI escape to clear screen AND scrollback buffer
+    # \033[2J clears visible screen, \033[3J clears scrollback buffer
+    print("\033[2J\033[3J\033[H", end='')
+
+    # Get current working directory with ~ shorthand
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+
+    console.print(f"[bold cyan]⚡ {current_model}[/bold cyan] [dim]|[/dim] [bold yellow]📁 {cwd}[/bold yellow]")
     console.print("[dim]/models | /clear | /exit | ctrl+l to clear | ctrl+d to exit | ctrl+c to cancel[/dim]\n")
 
 def clear_conversation():
@@ -106,8 +144,7 @@ def clear_conversation():
 
 def list_models():
     """Interactive model selection with fzf"""
-    global current_model
-    
+    global current_model, model_pricing
     # Check if fzf is available
     if subprocess.run(['which', 'fzf'], capture_output=True).returncode != 0:
         console.print("[red]fzf not found. Install it first.[/red]")
@@ -122,6 +159,9 @@ def list_models():
         )
         models = response.json()['data']
         
+        # Store models data for pricing lookup
+        models_dict = {m['id']: m for m in models}
+        
         # Format for fzf
         models_list = '\n'.join([f"{m['id']}\t{m.get('name', m['id'])}" for m in models])
         
@@ -134,23 +174,26 @@ def list_models():
             stderr=subprocess.PIPE,
             text=True
         )
-        
-        stdout, _ = proc.communicate(input=models_list)
+        stdout, _= proc.communicate(input=models_list)
         
         if proc.returncode == 0 and stdout.strip():
             selected = stdout.strip().split('\t')[0]
             current_model = selected
+            # Update pricing info
+            if selected in models_dict:
+                pricing = models_dict[selected].get('pricing', {})
+                model_pricing['prompt'] = float(pricing.get('prompt', 0))
+                model_pricing['completion'] = float(pricing.get('completion', 0))
+            
             console.print(f"\n[bold green]✓ Switched to: {current_model}[/bold green]\n")
             time.sleep(1)
             show_greeter()
             return True
         else:
             console.print()
-        
     except Exception as e:
         console.print(f"[red]Error fetching models: {e}[/red]")
         console.print()
-    
     return False
 
 def spinner():
@@ -168,7 +211,6 @@ def spinner():
 def extract_run_command(content: str) -> Optional[str]:
     """Extract command from [RUN:...] tag"""
     import re
-    
     # Look for [RUN:command] or [RUN command]
     match = re.search(r'\[RUN:?\s*([^\]]+)\]', content)
     if match:
@@ -177,27 +219,22 @@ def extract_run_command(content: str) -> Optional[str]:
 
 def execute_command(cmd: str) -> tuple[Optional[str], int]:
     """Execute command with user confirmation"""
+    # Get current working directory with ~ shorthand
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+
     # Print without Rich markup to avoid corruption
     print(f"\033[1;33m🔧 Command:\033[0m {cmd}")
+    print(f"\033[2m📁 {cwd}\033[0m")
     print(f"\033[1;32m[Y]es\033[0m / \033[1;31m[n]o\033[0m / \033[1;36m[e]dit\033[0m ? ", end="")
     sys.stdout.flush()
     
-    # Read single character without adding to history
-    import termios
-    import tty
+    # Read line input (wait for Enter)
+    reply = input().strip().lower()
     
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        reply = sys.stdin.read(1).lower()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    
-    print(reply)  # Echo the character
-    print()
-    
-    if reply in ['y', '\r', '\n', '']:
+    if reply in ['y', 'yes', '']:
         # Execute command
         try:
             result = subprocess.run(
@@ -207,87 +244,102 @@ def execute_command(cmd: str) -> tuple[Optional[str], int]:
                 text=True,
                 timeout=30
             )
-            
             output = result.stdout + result.stderr
-            
             if result.returncode != 0:
                 return f"[Command failed with exit code {result.returncode}]\n{output}", 1
             else:
                 return output, 0
-                
         except subprocess.TimeoutExpired:
             return "[Command timed out after 30 seconds]", 1
         except Exception as e:
             return f"[Command failed: {e}]", 1
-    
-    elif reply == 'e':
+    elif reply in ['e', 'edit']:
         # Let user edit the command
         print(f"\033[1;36mEdit command:\033[0m ", end="")
         sys.stdout.flush()
-        
-        # Restore normal terminal for editing
+        # Use readline for editing
         try:
             import readline
             readline.set_startup_hook(lambda: readline.insert_text(cmd))
-            # Use raw input to avoid history
-            edited_cmd = sys.stdin.readline().strip()
+            edited_cmd = input()
             readline.set_startup_hook()
-            
             if edited_cmd:
                 return execute_command(edited_cmd)
             else:
                 return None, 2  # Cancelled
         except:
-            edited_cmd = sys.stdin.readline().strip()
+            edited_cmd = input()
             if edited_cmd:
                 return execute_command(edited_cmd)
             else:
                 return None, 2
-    
     return None, 2  # User cancelled
 
 def stream_response(response, cancel_event):
     """Stream and parse response in a thread-safe way"""
     full_content = ""
-    total_tokens = 0
+    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}
+    last_chunk_time = time.time()
     
     try:
-        for line in response.iter_lines():
+        for line in response.iter_lines(chunk_size=None, decode_unicode=False):
             if cancel_event.is_set():
+                break
+            
+            # Check for stalled stream (no data for 30 seconds)
+            if time.time() - last_chunk_time > 30:
                 break
                 
             if not line:
                 continue
+                
+            last_chunk_time = time.time()
             
             # Explicitly decode as UTF-8
             try:
                 line = line.decode('utf-8') if isinstance(line, bytes) else line
             except UnicodeDecodeError:
                 continue
-            
+                
             if line.startswith('data: '):
                 data = line[6:]
-                
                 if data.strip() == '[DONE]':
                     break
-                
+                    
                 try:
                     chunk = json.loads(data)
                     
-                    # Get usage info if available
+                    # Get usage info if available (often in final chunk)
                     usage = chunk.get('usage', {})
                     if usage:
-                        total_tokens = usage.get('total_tokens', 0)
+                        usage_data['prompt_tokens'] = usage.get('prompt_tokens', 0)
+                        usage_data['completion_tokens'] = usage.get('completion_tokens', 0)
+                        usage_data['total_tokens'] = usage.get('total_tokens', 0)
+                        usage_data['cost'] = usage.get('cost', 0.0)
+                        
+                    # Check for finish reason (stream ending)
+                    finish_reason = chunk.get('choices', [{}])[0].get('finish_reason')
                     
                     delta = chunk.get('choices', [{}])[0].get('delta', {})
                     content = delta.get('content', '')
                     
                     if content:
                         full_content += content
-                        yield content, total_tokens
-                
+                        yield content, usage_data
+                    elif usage or finish_reason:
+                        # Yield usage data or finish signal even without content
+                        yield '', usage_data
+                        
                 except json.JSONDecodeError:
                     continue
+                except (KeyError, IndexError, TypeError):
+                    # Malformed chunk, skip it
+                    continue
+        
+        # Ensure we yield final usage data if we have it
+        if usage_data.get('total_tokens', 0) > 0:
+            yield '', usage_data
+            
     finally:
         response.close()
 
@@ -298,7 +350,7 @@ def make_api_call(recursive: bool = False) -> bool:
     cancel_event.clear()
     spinner_stop.clear()
     start_time = time.time()
-    total_tokens = 0
+    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}
     
     # Start spinner in background
     spinner_thread = threading.Thread(target=spinner, daemon=True)
@@ -324,8 +376,20 @@ def make_api_call(recursive: bool = False) -> bool:
                 stream=True,
                 verify=False
             )
-            if not cancel_event.is_set():
+            
+            # Check for HTTP errors
+            if resp.status_code != 200:
+                try:
+                    error_data = resp.json()
+                    error_msg = error_data.get('error', {}).get('message', resp.text)
+                except:
+                    error_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                
+                if not cancel_event.is_set():
+                    response_container['error'] = Exception(error_msg)
+            elif not cancel_event.is_set():
                 response_container['response'] = resp
+                
         except Exception as e:
             if not cancel_event.is_set():
                 response_container['error'] = e
@@ -342,93 +406,145 @@ def make_api_call(recursive: bool = False) -> bool:
             spinner_stop.set()
             return False
         time.sleep(0.05)
-    
-    # Stop spinner
-    spinner_stop.set()
-    spinner_thread.join(timeout=0.2)
-    
-    # Check for errors
+        
+    # Check for errors (keep spinner running)
     if response_container['error']:
+        spinner_stop.set()
+        spinner_thread.join(timeout=0.2)
         console.print(f"\n[red]Error: {response_container['error']}[/red]\n")
         return False
-    
+        
     response = response_container['response']
     if not response:
+        spinner_stop.set()
+        spinner_thread.join(timeout=0.2)
         console.print("\n[red]Error: No response received[/red]\n")
         return False
-    
+
     try:
         full_content = ""
         buffer = ""  # Buffer for detecting [RUN:] tags
         displayed_content = ""  # Track what we've displayed
         command_detected = False
-        
         import re
         
-        with Live("", refresh_per_second=20, console=console) as live:
-            for content_chunk, tokens in stream_response(response, cancel_event):
-                if cancel_event.is_set():
-                    return False
-                
-                full_content += content_chunk
-                buffer += content_chunk
-                total_tokens = tokens if tokens > 0 else total_tokens
-                
-                # Check if we have a complete [RUN:...] tag in buffer
-                run_match = re.search(r'\[RUN:?\s*([^\]]+)\]', buffer)
-                
-                if run_match:
-                    # Command detected! Stop streaming display
-                    command_detected = True
-                    live.update("")
-                    break
-                
-                # Check if buffer might be starting a [RUN tag
-                # Only hold back if we see potential start of tag
-                if '[RUN' in buffer[-10:] or '[RU' in buffer[-10:] or '[R' in buffer[-10:]:
-                    # Hold back potential tag start, display the rest
-                    safe_index = buffer.rfind('[', max(0, len(buffer) - 10))
-                    if safe_index > len(displayed_content):
-                        to_display = buffer[len(displayed_content):safe_index]
-                        if to_display:
-                            displayed_content += to_display
-                            live.update(Markdown(displayed_content, code_theme="nord"))
-                else:
-                    # Safe to display everything
-                    if len(buffer) > len(displayed_content):
-                        displayed_content = buffer
-                        live.update(Markdown(displayed_content, code_theme="nord"))
-            
-            # After stream ends, handle remaining buffer
-            if not command_detected and not cancel_event.is_set():
-                # Check one more time for command in final buffer
-                run_match = re.search(r'\[RUN:?\s*([^\]]+)\]', full_content)
-                if run_match:
-                    command_detected = True
-                else:
-                    # Display any remaining content
-                    if len(full_content) > len(displayed_content):
-                        live.update(Markdown(full_content, code_theme="nord"))
+        # Create iterator and wait for first chunk before stopping spinner
+        stream_iter = stream_response(response, cancel_event)
         
+        try:
+            first_chunk, first_usage = next(stream_iter)
+            usage_data = first_usage if first_usage.get('total_tokens', 0) > 0 else usage_data
+        except StopIteration:
+            # Stream ended immediately - empty response
+            spinner_stop.set()
+            spinner_thread.join(timeout=0.2)
+            if recursive:
+                # In recursive calls, empty responses might be OK (command already shown)
+                console.print("[dim][Empty response from model][/dim]\n")
+                return True
+            else:
+                console.print("\n[red]No content received from API[/red]\n")
+                return False
+        except Exception as e:
+            # Error in stream
+            spinner_stop.set()
+            spinner_thread.join(timeout=0.2)
+            console.print(f"\n[red]Stream error: {e}[/red]\n")
+            return False
+            
+        # Check for cancellation (but allow empty first chunks - they might have metadata)
+        if cancel_event.is_set():
+            spinner_stop.set()
+            spinner_thread.join(timeout=0.2)
+            return False
+            
+        # Got first chunk, now stop spinner and start displaying
+        spinner_stop.set()
+        spinner_thread.join(timeout=0.2)
+        
+        # Initialize with first chunk
+        full_content = first_chunk
+        buffer = first_chunk
+        last_render_length = 0
+        last_update_time = time.time()
+        update_interval = 0.05  # Update every 50ms for smooth streaming
+        
+        # Process first chunk
+        if cancel_event.is_set():
+            return False
+            
+        # Check if first chunk has command
+        run_match = re.search(r'\[RUN:?\s*([^\]]+)\]', buffer)
+        if run_match:
+            command_detected = True
+            
+        if not command_detected:
+            # Use default vertical_overflow to prevent duplication issues
+            with Live("", console=console, refresh_per_second=20, transient=False) as live:
+                # Update with first chunk
+                if first_chunk.strip():
+                    live.update(Markdown(full_content, code_theme="nord"))
+                    last_render_length = len(full_content)
+                    last_update_time = time.time()
+                
+                # Continue streaming chunks
+                for content_chunk, chunk_usage in stream_iter:
+                    if cancel_event.is_set():
+                        return False
+                        
+                    full_content += content_chunk
+                    buffer += content_chunk
+                    
+                    if chunk_usage.get('total_tokens', 0) > 0:
+                        usage_data = chunk_usage
+                    
+                    # Check if we have a complete [RUN:...] tag in buffer
+                    run_match = re.search(r'\[RUN:?\s*([^\]]+)\]', buffer)
+                    if run_match:
+                        # Command detected! Stop streaming
+                        command_detected = True
+                        break
+                        
+                    # Update display at intervals or when significant content added
+                    current_time = time.time()
+                    content_delta = len(full_content) - last_render_length
+                    
+                    if (current_time - last_update_time >= update_interval) or (content_delta > 50):
+                        live.update(Markdown(full_content, code_theme="nord"))
+                        last_render_length = len(full_content)
+                        last_update_time = current_time
+                        
+                # Final update with all content
+                if not command_detected and not cancel_event.is_set():
+                    run_match = re.search(r'\[RUN:?\s*([^\]]+)\]', full_content)
+                    if run_match:
+                        command_detected = True
+                    elif full_content.strip():
+                        live.update(Markdown(full_content, code_theme="nord"))
+                        
+            # Live exited - add newline for spacing
+            print()
+            
         # Check if cancelled
         if cancel_event.is_set():
             return False
-        
+            
         elapsed = time.time() - start_time
         
         # Check if response contains a command to run
         command = extract_run_command(full_content)
-        
         if command and not recursive:
             # Execute command directly without showing [RUN:...] output
             cmd_output, exec_status = execute_command(command)
             
             # Handle cancellation
             if exec_status == 2:
-                # Remove the user's unanswered question from history
-                messages.pop()
+                # User cancelled - add assistant's message without command tag, but keep user message
+                clean_content = re.sub(r'\[RUN:?\s*[^\]]+\]', '', full_content).strip()
+                if clean_content:
+                    messages.append({"role": "assistant", "content": clean_content})
                 return True
-            
+                
             # Add assistant's message to history
             messages.append({"role": "assistant", "content": full_content})
             
@@ -436,7 +552,7 @@ def make_api_call(recursive: bool = False) -> bool:
             if exec_status != 0:
                 messages.append({"role": "user", "content": "Command failed."})
                 return make_api_call(recursive=True)
-            
+                
             # Show command output
             console.print(f"[dim]{cmd_output}[/dim]")
             
@@ -445,22 +561,41 @@ def make_api_call(recursive: bool = False) -> bool:
             
             # Get final response from AI
             return make_api_call(recursive=True)
-        
+            
         # No command detected - response already displayed via Live
-        # Just show stats
-        cols = console.width
-        stats = f"{elapsed:.2f}s | {total_tokens} tokens"
-        stats_len = len(stats)
-        padding = cols - stats_len
-        console.print(f"{' ' * padding}[dim]{stats}[/dim]")
-        console.print()
         
+        # Show stats if we have content or tokens
+        if full_content.strip() or usage_data['total_tokens'] > 0:
+            cols = console.width
+            # Use OpenRouter's provided cost (they calculate it for us!)
+            cost = usage_data.get('cost', 0.0)
+            
+            # Format stats
+            total_tokens = usage_data['total_tokens']
+            
+            if cost > 0:
+                if cost < 0.01:
+                    cost_str = f" | ${cost:.6f}"
+                else:
+                    cost_str = f" | ${cost:.4f}"
+                stats = f"{elapsed:.2f}s | {total_tokens} tokens{cost_str}"
+            else:
+                stats = f"{elapsed:.2f}s | {total_tokens} tokens"
+                
+            stats_len = len(stats)
+            padding = cols - stats_len
+            console.print(f"{' ' * padding}[dim]{stats}[/dim]")
+            console.print()
+            
+        elif recursive:
+            # Recursive call with no response - this shouldn't happen but handle it
+            console.print("[dim][No response received][/dim]\n")
+            
         # Add to history (strip [RUN:] tags if this is a recursive call)
         if recursive and command:
             full_content = re.sub(r'\[RUN:?\s*[^\]]+\]', '', full_content).strip()
-        
+            
         messages.append({"role": "assistant", "content": full_content})
-        
         return True
         
     except KeyboardInterrupt:
@@ -494,19 +629,22 @@ def main():
         import readline
         # Just set history length for this session only
         readline.set_history_length(1000)
-        
         # Bind Ctrl+L to clear conversation
         readline.parse_and_bind('"\\C-l": "\\C-a\\C-k/clear\\n"')
-        
+        # Remove apostrophe from completer delimiters so it's treated as normal text
+        readline.set_completer_delims(readline.get_completer_delims().replace("'", ""))
     except ImportError:
         pass
-    
+        
     # Setup signal handler for Ctrl+C
     def handle_sigint(sig, frame):
         cancel_event.set()
         spinner_stop.set()
-    
+        
     signal.signal(signal.SIGINT, handle_sigint)
+    
+    # Fetch pricing for default model
+    fetch_model_pricing()
     
     # Show greeter
     show_greeter()
@@ -514,27 +652,27 @@ def main():
     # Main loop
     while True:
         cancel_event.clear()
-        
         try:
             # Use input() with prompt - readline handles it properly
-            user_input = input("\033[1;36m>\033[0m ").strip()
+            # Wrap ANSI codes in \x01 and \x02 so readline ignores them for cursor positioning
+            user_input = input("\x01\033[1;36m\x02>\x01\033[0m\x02 ").strip()
             
             if not user_input:
                 continue
-            
+                
             # Handle commands
             if user_input == "/models":
                 list_models()
                 continue
-            
+                
             if user_input == "/clear":
                 clear_conversation()
                 continue
-            
+                
             if user_input == "/exit":
                 print()
                 break
-            
+                
             # Add user message
             messages.append({"role": "user", "content": user_input})
             
@@ -546,7 +684,7 @@ def main():
                 if cancel_event.is_set() and messages and messages[-1]["role"] == "user":
                     messages.pop()
                     console.print()
-            
+                    
         except KeyboardInterrupt:
             print()
             continue
